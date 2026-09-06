@@ -7,11 +7,16 @@ import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
+import java.io.IOException;
+import java.math.BigInteger;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -23,10 +28,15 @@ import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
 public class URLShortenerApp {
-    private static final String BASE_URL = "https://sho.rt/";
     private static final char[] BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".toCharArray();
     private static final Font UI_FONT = new Font("SansSerif", Font.PLAIN, 15);
+    private static final Map<String, String> SHORT_URLS = new ConcurrentHashMap<>();
+    private static volatile HttpServer redirectServer;
+    private static volatile String redirectBaseUrl;
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(URLShortenerApp::createAndShowUi);
@@ -66,7 +76,7 @@ public class URLShortenerApp {
         gbc.gridy = 1;
         form.add(inputField, gbc);
 
-        JButton shortenButton = new JButton("Shorten URL");
+        JButton shortenButton = new JButton("Shorten Link");
         shortenButton.setFont(UI_FONT.deriveFont(Font.BOLD));
         shortenButton.setBackground(orange);
         shortenButton.setForeground(white);
@@ -133,6 +143,12 @@ public class URLShortenerApp {
             throw new IllegalArgumentException("Please enter a valid http/https URL.");
         }
 
+        ensureRedirectServerStarted();
+        String token = createOrReuseToken(normalizedUrl);
+        return redirectBaseUrl + token;
+    }
+
+    private static String createOrReuseToken(String normalizedUrl) {
         byte[] digest;
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
@@ -141,18 +157,66 @@ public class URLShortenerApp {
             throw new IllegalStateException("Unable to create short URL.", e);
         }
 
-        long value = 0;
-        for (int i = 0; i < 6; i++) {
-            value = (value << 8) | (digest[i] & 0xffL);
+        String base62Digest = encodeBase62(digest);
+        for (int length = 7; length <= Math.min(12, base62Digest.length()); length++) {
+            String token = base62Digest.substring(0, length);
+            String existing = SHORT_URLS.putIfAbsent(token, normalizedUrl);
+            if (existing == null || existing.equals(normalizedUrl)) {
+                return token;
+            }
         }
 
-        StringBuilder token = new StringBuilder();
-        for (int i = 0; i < 7; i++) {
-            token.append(BASE62[(int) (value % BASE62.length)]);
-            value /= BASE62.length;
+        throw new IllegalStateException("Unable to create unique short URL.");
+    }
+
+    private static synchronized void ensureRedirectServerStarted() {
+        if (redirectServer != null) {
+            return;
         }
 
-        return BASE_URL + token.reverse();
+        try {
+            redirectServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            redirectServer.createContext("/", URLShortenerApp::handleRedirect);
+            redirectServer.start();
+            redirectBaseUrl = "http://127.0.0.1:" + redirectServer.getAddress().getPort() + "/";
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to start redirect server.", e);
+        }
+    }
+
+    private static void handleRedirect(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        String token = path != null && path.length() > 1 ? path.substring(1) : "";
+        String destination = SHORT_URLS.get(token);
+
+        if (destination == null) {
+            byte[] message = "Short URL not found".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(404, message.length);
+            exchange.getResponseBody().write(message);
+            exchange.close();
+            return;
+        }
+
+        exchange.getResponseHeaders().set("Location", destination);
+        exchange.sendResponseHeaders(302, -1);
+        exchange.close();
+    }
+
+    private static String encodeBase62(byte[] input) {
+        BigInteger value = new BigInteger(1, input);
+        if (value.equals(BigInteger.ZERO)) {
+            return "0";
+        }
+
+        BigInteger base = BigInteger.valueOf(BASE62.length);
+        StringBuilder encoded = new StringBuilder();
+        while (value.compareTo(BigInteger.ZERO) > 0) {
+            BigInteger[] parts = value.divideAndRemainder(base);
+            encoded.append(BASE62[parts[1].intValue()]);
+            value = parts[0];
+        }
+
+        return encoded.reverse().toString();
     }
 
     private static String normalizeUrl(String value) {
