@@ -4,8 +4,10 @@ A Java Swing app that lets a user paste a long URL and get a shorter URL.
 
 ## Features
 - Orange and white themed GUI
-- Input box for a long URL
+- Larger, more readable text and improved window layout
+- Input box for a long URL (accepts values like `example.com` and `https://example.com`)
 - One-click short URL generation
+- Copy button to place the shortened URL on your clipboard
 
 ## Run
 From `/home/runner/work/URL-Shortener/URL-Shortener`:
